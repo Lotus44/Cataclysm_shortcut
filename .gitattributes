@@ -1,0 +1,7 @@
+# 统一换行，避免在 Windows 上 checkout 后 .bat 变成 LF 导致 CMD 解析异常
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.py  text eol=lf
+*.pyw text eol=lf
+*.md  text eol=lf

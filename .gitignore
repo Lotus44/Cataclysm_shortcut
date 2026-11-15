@@ -1,0 +1,11 @@
+# runtime data (config, log, snapshots)
+.cdda_snapshots/
+# python cache
+__pycache__/
+*.py[cod]
+# shortcuts
+*.lnk
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
