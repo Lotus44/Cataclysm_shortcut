@@ -809,6 +809,41 @@ class SnapshotManager:
                 out = [s for s in out if s.world == world]
             return out
 
+    def usage(self) -> dict[str, Any]:
+        """统计快照数据目录的"逻辑大小"与"硬链接去重后的实占"。
+
+        CDDA 的世界目录动辄上万个文件，同一份文件在每份快照里都是同一个硬链接；
+        直接把每份快照的 ``total_bytes`` 加起来会得到"全都完整拷贝"的假象。
+        这里按 (st_dev, st_ino) 只计一次，得到真正吃掉的磁盘空间；
+        ``logical`` 则是逐份累加的表观大小，两者之差就是硬链接省下来的量。
+        """
+        logical = 0
+        actual = 0
+        files = 0
+        seen: set[tuple[int, int]] = set()
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+            for name in filenames:
+                try:
+                    st = os.stat(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                logical += st.st_size
+                files += 1
+                if st.st_nlink > 1:
+                    key = (st.st_dev, st.st_ino)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                actual += st.st_size
+        return {
+            "root": self.root,
+            "logical": logical,
+            "actual": actual,
+            "saved": max(0, logical - actual),
+            "files": files,
+        }
+
     def latest_for(self, world: str) -> Optional[Snapshot]:
         snaps = self.snapshots(world)
         return snaps[-1] if snaps else None

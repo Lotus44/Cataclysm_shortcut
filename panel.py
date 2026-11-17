@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -297,6 +298,9 @@ class QuickPanel:
         self._confirm_sid: Optional[int] = None
         self._game_running = False
         self._proc_job: Optional[str] = None
+        #: 快照文件夹占用统计（后台线程扫盘，避免上万个小文件卡住界面）
+        self._size_running = False
+        self._size_pending = False
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -379,6 +383,13 @@ class QuickPanel:
             anchor="w", justify="left", wraplength=PANEL_W - 40,
         )
         self.quota_line.pack(fill="x", padx=14)
+
+        # ---- 快照文件夹占用（逻辑大小 vs 硬链接实占）
+        self.size_line = tk.Label(
+            shell, text="快照文件夹：统计中…", bg=BG_ALT, fg=FG, font=_ui_font(9),
+            anchor="w", justify="left", padx=10, pady=4, wraplength=PANEL_W - 40,
+        )
+        self.size_line.pack(fill="x", padx=14, pady=(6, 0))
 
         # ---- 快照列表
         listwrap = tk.Frame(shell, bg=BG)
@@ -598,6 +609,7 @@ class QuickPanel:
             self.world_label.configure(text="没有找到存档世界")
             self.sub_label.configure(text=f"存档目录: {self.manager.save_dir}")
             self.detail.configure(text="")
+            self._update_size()
             return
 
         info = self.manager.world_info(world)
@@ -616,6 +628,7 @@ class QuickPanel:
             logging.exception("读取快照列表失败")
             self.snapshots = []
         self._update_quota(world)
+        self._update_size()
         # 每份快照的内容指纹只在刷新时算一次。
         # 判据：存档目录的内容与它相同 —— 刚拍的新快照、刚读取的那一份都会命中。
         self.active_sid = self._active_sid()
@@ -639,6 +652,52 @@ class QuickPanel:
         color = ACCENT if (keep > 0 and count >= keep) else FG_DIM
         try:
             self.quota_line.configure(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _update_size(self) -> None:
+        """后台统计快照文件夹的逻辑大小与硬链接实占，算完回主线程更新标签。"""
+        if self._size_running:
+            self._size_pending = True
+            return
+        self._size_running = True
+
+        def worker() -> None:
+            data = None
+            try:
+                data = self.manager.usage()
+            except Exception:
+                logging.debug("统计快照占用失败", exc_info=True)
+
+            def done() -> None:
+                self._size_running = False
+                try:
+                    if data:
+                        self._apply_size(data)
+                    if self._size_pending:
+                        self._size_pending = False
+                        self._update_size()
+                except Exception:
+                    logging.debug("刷新占用显示失败", exc_info=True)
+
+            try:
+                self.app.post(done)
+            except Exception:
+                self._size_running = False
+
+        threading.Thread(target=worker, name="snapshot-usage", daemon=True).start()
+
+    def _apply_size(self, data: dict) -> None:
+        saved = int(data.get("saved", 0) or 0)
+        text = (f"快照文件夹 {fmt_size(data.get('logical', 0))}"
+                f" → 硬链接实占 {fmt_size(data.get('actual', 0))}")
+        if saved > 0:
+            text += f"（已省 {fmt_size(saved)}）"
+        files = int(data.get("files", 0) or 0)
+        if files:
+            text += f"　{files} 个文件"
+        try:
+            self.size_line.configure(text=text, fg=ACCENT if saved > 0 else FG)
         except Exception:
             pass
 
