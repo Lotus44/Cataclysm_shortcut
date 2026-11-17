@@ -3115,8 +3115,6 @@ class SnapshotApp:
 
     def show_panel(self) -> None:
         if self.panel:
-            self.world = self.current_world()
-            self.panel.refresh()
             self.panel.show()
 
     def show_panel_if_hidden(self) -> None:
@@ -3133,8 +3131,6 @@ class SnapshotApp:
         if self.panel.visible:
             self.panel.hide()
         else:
-            self.world = self.current_world()
-            self.panel.refresh()
             self.panel.show()
 
 
