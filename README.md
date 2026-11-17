@@ -21,6 +21,10 @@ Cataclysm Shortcut 把这件事变成一次按键：
 * **F6**：随时回到最近一张快照（自动退出游戏、替换存档、重启到该世界）。
 * **F4**：打开面板，从列表里挑任意一张快照还原，或给它起名设为永久存档。
 
+## 界面预览
+
+<img width="775" height="670" alt="界面预览" src="https://github.com/user-attachments/assets/ab4c0dff-5aa3-4ada-8d23-2563c3e63616" />
+
 ---
 
 ## 2. 功能一览
