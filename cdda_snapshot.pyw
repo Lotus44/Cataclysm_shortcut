@@ -395,8 +395,36 @@ def format_game_turn(turn: Optional[int], season_days: int = SEASON_DAYS) -> str
     return (f"{year + 1} 年 {SEASON_NAMES[season]} {day + 1} 日 "
             f"{secs // 3600:02d}:{secs % 3600 // 60:02d}")
 
+def _turn_from_log(world_dir: str) -> Optional[int]:
+    """从角色日志取最晚的游戏时间"""
+    try:
+        names = [n for n in os.listdir(world_dir)
+                 if n.startswith("#") and n.lower().endswith(".log")]
+    except OSError:
+        return None
+    best: Optional[int] = None
+    for name in names:
+        try:
+            with open(os.path.join(world_dir, name), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                entries = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            t = entry.get("time") if isinstance(entry, dict) else None
+            if isinstance(t, int) and (best is None or t > best):
+                best = t
+    return best
+
 def read_game_turn(world_dir: str) -> Optional[int]:
-    """从该世界最新的角色存档（gzip JSON）里读游戏内 turn；1 turn = 1 秒。"""
+    """从角色日志取turn"""
+    turn = _turn_from_log(world_dir)
+    if turn is not None:
+        return turn
+
+    """从角色存档取turn"""
     try:
         entries = os.listdir(world_dir)
     except OSError:
@@ -404,7 +432,7 @@ def read_game_turn(world_dir: str) -> Optional[int]:
     best, best_mtime = "", -1.0
     for entry in entries:
         low = entry.lower()
-        if not entry.startswith("#") or ".sav" not in low:
+        if not entry.startswith("#") or not low.endswith(".sav"):
             continue
         try:
             mt = os.path.getmtime(os.path.join(world_dir, entry))
