@@ -292,6 +292,16 @@ class QuickPanel:
         self.snapshots: list[Any] = []      # 倒序（最新在前）
         #: 当前生效的快照编号（刚拍的 / 刚读回的），用于列表高亮
         self.active_sid: Optional[int] = None
+        #面板刷新
+        self._refresh_running = False
+        self._refresh_pending = False
+        #占用统计
+        self._size_running = False
+        self._size_pending = False
+        self._size_cache: Optional[dict] = None
+        self._size_at = 0.0
+        #当前游戏回合数
+        self.game_turn: Optional[int] = None
         self.visible = False
         self.modal_open = False             # 有模态对话框时不做自动隐藏
         self._autohide_job: Optional[str] = None
@@ -419,7 +429,7 @@ class QuickPanel:
         self.listbox.configure(yscrollcommand=scroll.set)
 
         self.listbox.bind("<Double-Button-1>", lambda _e: self.restore_selected())
-        self.listbox.bind("<<ListboxSelect>>", lambda _e: self._update_detail())
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
         self.listbox.bind("<Return>", lambda _e: self.restore_selected())
         self.listbox.bind("<Delete>", lambda _e: self.delete_selected())
         self.listbox.bind("<MouseWheel>", self._on_wheel)
@@ -494,7 +504,7 @@ class QuickPanel:
         except Exception:
             logging.debug("自适应高度失败", exc_info=True)
 
-    def show(self, refresh bool = True) -> None:
+    def show(self, refresh: bool = True) -> None:
         if self.win is None:
             return
         if refresh:
@@ -605,10 +615,10 @@ class QuickPanel:
 
     def refresh(self, world: Optional[str] = None) -> None:
         """刷新后立即返回，运行中后台收集线程唯一，其余线程合并"""
-        if self.refresh_running:
-            self.refresh_pending = True
+        if self._refresh_running:
+            self._refresh_pending = True
             return
-        self.refresh_running = True
+        self._refresh_running = True
 
         def worker() -> None:
             data = None
@@ -618,14 +628,14 @@ class QuickPanel:
                 logging.exception("收集面板数据失败")
 
             def done() -> None:
-                self.refresh_running = False
-                if data in not None:
+                self._refresh_running = False
+                if data is not None:
                     self._apply(data)
-                if self.refresh_pending:
-                    self.refresh_pending = False
+                if self._refresh_pending:
+                    self._refresh_pending = False
                     self.refresh()
 
-            self app.post(done)
+            self.app.post(done)
 
         threading.Thread(target=worker, name="pannel_refresh", daemon=True).start()
 
@@ -641,9 +651,43 @@ class QuickPanel:
         except Exception:
             logging.exception("读取快照列表失败")
             snapshots = []
-        quota = self.manager._auto_prune_state(world)
+        try:
+            quota = self.manager.auto_prune_state(world)
+        except Exception:
+            logging.debug("读取配额失败", exc_info=True)
+            quota = None
         active = self._active_sid(world, snapshots)
-        return{"world": world, "snapshots": [snapshots], "info": info, "quota": quota, "active": active}
+        try:
+            from cdda_snapshot import read_game_turn
+            world_turn = read_game_turn(info.path)
+        except Exception:
+            logging.debug("读取游戏内时间失败", exc_info=True)
+            world_turn = None
+        return {"world": world, "snapshots": snapshots, "info": info,
+                "quota": quota, "active": active, "world_turn": world_turn}
+
+    def _update_header(self, info=None) -> None:
+        """
+        顶栏时间跟随选中存档
+        "最后存档"跟随.sav的mtime
+        """
+        from winapi import sav_mtime
+        from cdda_snapshot import format_game_turn
+
+        snap = self.selected()
+        if snap is not None:
+            mt = sav_mtime(snap.path) or snap.created
+            stem = f"「{snap.label()}」"
+            prefix = "该快照存档"
+        else:
+            info = info or self.manager.world_info(self.app.world or "")
+            mt = sav_mtime(info.path)
+            stem = ""
+            prefix = "最后存档"
+        when = fmt_relative(mt) if mt else "—"
+        absolute = time.strftime("%m-%d %H:%M", time.localtime(mt)) if mt else "—"
+        gtime = format_game_turn(snap.game_turn) if snap is not None else format_game_turn(self.game_turn)
+        self.sub_label.configure(text=f"{prefix} {when}（{absolute}）{stem}　游戏时间 {gtime}")
 
     def _apply(self, data: dict) -> None:
         """主线程应用数据"""
@@ -651,32 +695,32 @@ class QuickPanel:
         self.app.world = world
         if not world:
             self.snapshots = []
+            self.active_sid = None
             self._fill_list()
             self.world_label.configure(text="未找到存档世界")
             self.sub_label.configure(text=f"存档目录：{self.manager.save_dir}")
-            self.detile.configure(text="")
+            self.detail.configure(text="")
             self._update_size()
             return
 
         info = data["info"]
-        gt = info.game_time.strftime("%Y-%m-%d %H:%M") if info.game_time else "—"
-        self.world_label.configure(text=f"世界「{info.name}」　角色「{info.character}」")
-        try:
-            ago = fmt_relative(os.path.getmtime(os.path.join(info.path, "world_timestamp.json")))
-        except OSError:
-            ago = "—"
-        self.sub_label.configure(text=f"最后存档 {ago}　游戏时间 {gt}")
-
         self.snapshots = data["snapshots"]
-        self._apply_quota(data["quota"])
+        self.active_sid = data.get("active")
+        self.game_turn = data.get("world_turn")
+        self.world_label.configure(text=f"世界「{info.name}」　角色「{info.character}」")
+        self._update_quota(world, data.get("quota"))
         self._update_size()
-        self.active_sid = data["active"]
         self._fill_list()
+        self._update_header(info)
 
-    def _update_quota(self, world: str) -> None:
+    def _update_quota(self, world: Optional[str], state=None) -> None:
         """显示"可自动删除的份数 / 上限"，以及永久存档份数。"""
         try:
-            count, keep, permanent = self.manager.auto_prune_state(world)
+            if state is None:
+                count, keep, permanent = self.manager.auto_prune_state(
+                    world or self.app.world or "")
+            else:
+                count, keep, permanent = state
         except Exception:
             logging.debug("读取配额失败", exc_info=True)
             return
@@ -694,7 +738,7 @@ class QuickPanel:
         except Exception:
             pass
 
-    def _update_size(self) -> None:
+    def _update_size(self, force: bool = False) -> None:
         """后台统计快照的逻辑大小与压缩实占；结果缓存SIZE_TTL秒，增删快照时force重算，重算后更新标签"""
         now = time.monotonic()
         if not force and self._size_cache and now - self._size_at < SIZE_TTL:
@@ -710,7 +754,7 @@ class QuickPanel:
             try:
                 data = self.manager.usage()
             except Exception:
-                logging debug("统计快照占用失败", exc_info=True)
+                logging.debug("统计快照占用失败", exc_info=True)
 
             def done() -> None:
                 self._size_running = False
@@ -718,9 +762,9 @@ class QuickPanel:
                     self._size_cache = data
                     self._size_at = time.monotonic()
                     self._apply_size(data)
-                if size._size_pending:
-                    size._size_pending = False
-                    self._update_size()
+                if self._size_pending:
+                    self._size_pending = False
+                    self._update_size(force=True)
 
             self.app.post(done)
 
@@ -765,7 +809,16 @@ class QuickPanel:
             # 可疑档：确定没通过校验的标 "⚠未校验"，旧版本没有校验记录的标 "?旧档"。
             # 分级是为了别喊狼来了 —— 旧档大多只是地图没动过。
             level, reason = self._suspect(snap)
-            if level == "" and snap.sid not in self._suspicion_cache:
+            warn = {"bad": " ⚠未校验", "legacy": " ?旧档"}.get(level, "")
+            line = (
+                f"{idx:>2}.{star}{cursor}{snap.label()}{tag}  "
+                f"{snap.created_local.strftime('%m-%d %H:%M:%S')}  "
+                f"({fmt_relative(snap.created)})  "
+                f"{fmt_size(snap.total_bytes):>9}  "
+                f"{snap.file_count:>4} 文件 {kind}{warn}"
+            )
+            self.listbox.insert(tk.END, line)
+            if level == "" and snap.path not in self.manager._suspicion_cache:
                 unknown.append(snap)
             if is_active:
                 self.listbox.itemconfigure(idx - 1, background=BG_ACTIVE, foreground=ACCENT)
@@ -807,53 +860,52 @@ class QuickPanel:
             logging.debug("可疑判定失败", exc_info=True)
             return ("", "")
 
-    def _active_sid(self, world: Optional[str] = None, snapshot: Optional[str] = None) -> Optional[int]:
-        """对capture_verified为True的快照仅作fingerprint比对"""
+    def _active_sid(self, world: Optional[str] = None, snapshots: Optional[list] = None) -> Optional[int]:
+        """可信快照比对fingerprint，不可信快照后台比对"""
+        from cdda_snapshot import _fingerprint
+
         world = world or self.app.world
-        snapshots = snapshots if snapshots is not None else self.snapshots
+        snaps = snapshots if snapshots is not None else self.snapshots
         if not world:
             return None
-        try:
-            from cdda_snapshot import self_module
-
-            core = self_module()
-            if core is None:
-                return None
-            path = os.path.join(self.manager.save_dir, world)
-            if not os.path.isdir(path):
-                return None
-
-            live = core._fingerprint(path)
-            for snap in snapshots:
-                #比对可信有存值的存档
-                if (snap.capture_verified is True and snap.content_fingerprint and snap.content_fingerprint == live):
-                    return snap.sid
-            self.verify_active_later(path, live, snapshots)
-            #capture_verified为空的存档verify_active_later稍后计算
+        path = os.path.join(self.manager.save_dir, world)
+        if not os.path.isdir(path):
             return None
+        try:
+            live = _fingerprint(path)
         except Exception:
-            logging.debug("判定当前快照失败", exc_info=True)
+            logging.debug("计算实时存档指纹失败", exc_info=True)
+            return None
+
+        for snap in snaps:
+            #比对可信有存值的存档
+            if (snap.capture_verified is True and snap.content_fingerprint and snap.content_fingerprint == live):
+                return snap.sid
+        self.verify_active_later(path, live, snaps)
+        #capture_verified为空的存档verify_active_later稍后计算
         return None
 
     def verify_active_later(self, path: str, live: str, snapshots: list) -> None:
         """对非可信无存值的存档后台核对，结果用post返回主线程"""
         todo = [s for s in snapshots if not (s.capture_verified is True and s.content_fingerprint)]
-        return if not todo
+        if not todo:
+            return
 
         def worker() -> None:
             hit = None
             for snap in todo:
                 try:
-                 if self.manager.snapshot_fingerprint(snap) == live:
-                    hit = snap.sid
-                    break
-            except Exception:
-                logging debug("后台核对快照失败", exc_info=True)
+                    if self.manager.snapshot_fingerprint(snap) == live:
+                        hit = snap.sid
+                        break
+                except Exception:
+                    logging.debug("后台核对快照失败", exc_info=True)
 
-            def done() ->None:
+            def done() -> None:
                 if hit is not None and self.active_sid != hit:
                     self.active_sid = hit
                     self._fill_list()
+
             self.app.post(done)
 
         threading.Thread(target=worker, name="active-verify", daemon=True).start()
@@ -871,9 +923,9 @@ class QuickPanel:
             return
         gt = "—"
         if snap.game_time:
-            from cdda_snapshot import decode_game_timestamp
+            from cdda_snapshot import decode_save_timestamp
 
-            parsed = decode_game_timestamp(snap.game_time)
+            parsed = decode_save_timestamp(snap.game_time)
             gt = parsed.strftime("%Y-%m-%d %H:%M") if parsed else "—"
         linked = f"　硬链接复用 {snap.linked_files}" if snap.linked_files else ""
         note = f"　备注: {snap.note}" if snap.note else ""
@@ -914,6 +966,7 @@ class QuickPanel:
             self.listbox.selection_set(idx)
             self.listbox.see(idx)
             self._update_detail()
+            self._update_header()
             snap = self.snapshots[idx]
             if self._confirm_sid == snap.sid and time.time() < self._confirm_until:
                 self._confirm_sid = None
@@ -938,6 +991,10 @@ class QuickPanel:
     def snapshot_disk(self) -> None:
         """只打包磁盘上已有的存档，不打扰游戏。"""
         self.app.do_snapshot(mode="disk", note="磁盘快照")
+
+    def _on_select(self, _event=None) -> None:
+        self._update_detail()
+        self._update_header()
 
     # -------------------------------------------------- 命名 / 永久存档
 

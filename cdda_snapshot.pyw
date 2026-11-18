@@ -370,8 +370,8 @@ def decode_char_filename(filename: str) -> Optional[str]:
     return name if name and name.isprintable() else None
 
 
-def decode_game_timestamp(value: Any) -> Optional[_dt.datetime]:
-    """CDDA 的 world_timestamp 是“YYYYMMDDhhmmss + 纳秒”的 20 位字符串。"""
+def decode_save_timestamp(value: Any) -> Optional[_dt.datetime]:
+    """CDDA 的 save_timestamp 是“YYYYMMDDhhmmss + 纳秒”的 20 位字符串。"""
     if value is None:
         return None
     text = str(value).strip().strip('"')
@@ -382,6 +382,50 @@ def decode_game_timestamp(value: Any) -> Optional[_dt.datetime]:
     except ValueError:
         return None
 
+
+SEASON_DAYS = 91
+SEASON_NAMES = ("春", "夏", "秋", "冬")
+
+def format_game_turn(turn: Optional[int], season_days: int = SEASON_DAYS) -> str:
+    if turn is None:
+        return "—"
+    days, secs = divmod(max(0, int(turn)), 86400)
+    year, rem = divmod(days, 4 * season_days)
+    season, day = divmod(rem, season_days)
+    return (f"{year + 1} 年 {SEASON_NAMES[season]} {day + 1} 日 "
+            f"{secs // 3600:02d}:{secs % 3600 // 60:02d}")
+
+def read_game_turn(world_dir: str) -> Optional[int]:
+    """从该世界最新的角色存档（gzip JSON）里读游戏内 turn；1 turn = 1 秒。"""
+    try:
+        entries = os.listdir(world_dir)
+    except OSError:
+        return None
+    best, best_mtime = "", -1.0
+    for entry in entries:
+        low = entry.lower()
+        if not entry.startswith("#") or ".sav" not in low:
+            continue
+        try:
+            mt = os.path.getmtime(os.path.join(world_dir, entry))
+        except OSError:
+            continue
+        if mt > best_mtime:
+            best, best_mtime = entry, mt
+    if not best:
+        return None
+    try:
+        with gzip.open(os.path.join(world_dir, best), "rt", encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    for holder in (data, data.get("avatar") or {}, data.get("player") or {}):
+        if isinstance(holder, dict) and "turn" in holder:
+            try:
+                return int(holder["turn"])
+            except (TypeError, ValueError):
+                pass
+    return None
 
 def safe_world_dirname(world: str) -> str:
     """保证世界名可以安全地用作目录/文件名（保留中文，剔除 Windows 非法字符）。"""
@@ -479,8 +523,8 @@ class WorldInfo:
     path: str
     character: str = "(未知)"
     character_key: str = ""
-    game_time: Optional[_dt.datetime] = None
-    timestamp_raw: str = ""
+    save_time: Optional[_dt.datetime] = None    #现实存档时间
+    save_time_raw: str = ""
     mods: list[str] = field(default_factory=list)
 
     @property
@@ -511,6 +555,7 @@ class Snapshot:
     capture_verified: Optional[bool] = None
     #: 拍摄时按快照实际内容算出的指纹（旧档可能为空或不符，只当快速过滤器用）
     content_fingerprint: str = ""
+    game_turn: Optional[int] = None
 
     @property
     def created_local(self) -> _dt.datetime:
@@ -541,6 +586,7 @@ class Snapshot:
             "permanent": self.permanent,
             "capture_verified": self.capture_verified,
             "content_fingerprint": self.content_fingerprint,
+            "game_turn": self.game_turn
         }
 
     @staticmethod
@@ -563,6 +609,8 @@ class Snapshot:
             permanent=bool(obj.get("permanent", False)),
             capture_verified=None if verified is None else bool(verified),
             content_fingerprint=str(obj.get("content_fingerprint", "") or ""),
+            game_turn=obj.get("game_turn"),
+
         )
 
 
@@ -700,13 +748,12 @@ class SnapshotManager:
     def _read_world(self, world: str) -> WorldInfo:
         path = os.path.join(self.save_dir, world)
         info = WorldInfo(name=world, path=path)
-
-        ts_file = os.path.join(path, "world_timestamp.json")
+        ts_file = os.path.join(path, "save_timestamp.json")
         if os.path.isfile(ts_file):
             try:
                 with open(ts_file, "r", encoding="utf-8", errors="replace") as fh:
-                    info.timestamp_raw = str(json.load(fh))
-                info.game_time = decode_game_timestamp(info.timestamp_raw)
+                    info.save_time_raw = str(json.load(fh))
+                info.save_time = decode_save_timestamp(info.save_time_raw)
             except Exception:
                 pass
 
@@ -1075,12 +1122,12 @@ class SnapshotManager:
                 "created": time.time(),
                 "note": note,
                 "kind": kind,
-                "game_time": info.timestamp_raw,
+                "game_time": info.save_time_raw,
                 "file_count": file_count,
                 "total_bytes": total_bytes,
                 "linked_files": linked,
                 "copied_files": copied,
-                "timestamp_raw": info.timestamp_raw,
+                "save_time_raw": info.save_time_raw,
                 "mods": info.mods,
                 "content_fingerprint": actual_fp,
                 "capture_verified": stable,
@@ -1100,12 +1147,13 @@ class SnapshotManager:
                 character=info.character,
                 note=note,
                 kind=kind,
-                game_time=info.timestamp_raw,
+                game_time=info.save_time_raw,
                 file_count=file_count,
                 total_bytes=total_bytes,
                 parent_sid=prev_sid,
                 linked_files=linked,
                 capture_verified=stable,
+                game_turn=read_game_turn(info.path),
             )
             # 提交阶段必须**重新读一遍** manifest：静默期里放开了锁，
             # 别人（面板刷新时的自愈整理等）可能已经改过它，
@@ -2600,7 +2648,7 @@ class SnapshotApp:
         best_mtime = -1.0
         for info in self.manager.list_worlds():
             try:
-                mtime = os.path.getmtime(os.path.join(info.path, "world_timestamp.json"))
+                mtime = os.path.getmtime(os.path.join(info.path, "save_timestamp.json"))
             except OSError:
                 try:
                     mtime = os.path.getmtime(info.path)
@@ -3170,16 +3218,16 @@ def snapshot_health(snap: Snapshot, lag_warn_seconds: float = 60.0) -> dict[str,
     if not has_over:
         out["warnings"].append("没有超图文件（overmaps/）")
 
-    ts_path = os.path.join(snap.path, "world_timestamp.json")
-    out["world_timestamp"] = ""
+    ts_path = os.path.join(snap.path, "save_timestamp.json")
+    out["save_timestamp"] = ""
     if os.path.isfile(ts_path):
         try:
             with open(ts_path, "r", encoding="utf-8", errors="replace") as fh:
-                out["world_timestamp"] = str(_json.load(fh))
+                out["save_timestamp"] = str(_json.load(fh))
         except Exception:
-            out["warnings"].append("world_timestamp.json 无法解析")
+            out["warnings"].append("save_timestamp.json 无法解析")
     else:
-        out["warnings"].append("缺少 world_timestamp.json")
+        out["warnings"].append("缺少 save_timestamp.json")
 
     # 时间一致性
     def newest(pred) -> float:
@@ -3305,7 +3353,7 @@ def cli_list(manager: SnapshotManager) -> int:
             continue
         for snap in snaps:
             when = snap.created_local.strftime("%m-%d %H:%M:%S")
-            gtime = decode_game_timestamp(snap.game_time)
+            gtime = decode_save_timestamp(snap.game_time)
             gtext = gtime.strftime("%Y-%m-%d %H:%M") if gtime else "—"
             print(
                 f"  {snap.label()}  {when}  游戏内 {gtext}  "
