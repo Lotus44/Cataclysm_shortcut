@@ -9,3 +9,5 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
+# vs code
+.vs/
