@@ -23,7 +23,7 @@ Cataclysm Shortcut 把这件事变成一次按键：
 
 ## 界面预览
 
-![界面预览](.\preview_interface.png)
+![界面预览](preview_interface.png)
 
 ---
 
